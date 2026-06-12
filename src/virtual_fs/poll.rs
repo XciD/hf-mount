@@ -225,19 +225,25 @@ impl super::VirtualFs {
             let mut inode_table = inodes.write().expect("inodes poisoned");
 
             for update in &updates {
-                inode_table.update_remote_file(
+                // Only invalidate kernel caches when the rotation actually
+                // applied. A refusal (dirty inode, open handles) leaves the
+                // local view unchanged: invalidating would drop the page
+                // cache of an actively-read file every poll cycle for the
+                // lifetime of the handle, for no visible state change. The
+                // refused update is re-detected and applied by a later cycle
+                // once the inode quiesces.
+                if inode_table.update_remote_file(
                     update.ino,
                     update.hash.clone(),
                     update.etag.clone(),
                     update.size,
                     update.mtime,
-                );
-                let kind = if inode_table.has_open_handles(update.ino) {
-                    InvalKind::AttrOnly
-                } else {
-                    InvalKind::Pages
-                };
-                inos_to_invalidate.push((update.ino, kind));
+                ) {
+                    // Rotation only applies when there are no open handles
+                    // (see `update_remote_file`'s open-handle guard), so a full
+                    // Pages invalidation is always safe here.
+                    inos_to_invalidate.push((update.ino, InvalKind::Pages));
+                }
             }
 
             for ino in &deletions {
