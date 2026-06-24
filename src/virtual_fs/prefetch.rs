@@ -20,6 +20,15 @@ pub(crate) const SEEK_WINDOW: usize = 1_048_576; // 1 MiB
 /// stream. Reads within this range are served by draining/discarding the
 /// gap from the current stream (cheaper than a new CAS request).
 pub(crate) const FORWARD_SKIP: u64 = 16 * 1_048_576; // 16 MiB
+/// Size of the pinned head region. Media containers keep their parse index at
+/// the start (EBML header / Tracks / SeekHead, MP4 moov when faststart). A
+/// player re-reads it on every seek, so we pin it for the handle's lifetime,
+/// immune to the streaming buffer's churn.
+pub(crate) const PIN_HEAD: u64 = 16 * 1_048_576; // 16 MiB
+/// Size of the pinned tail region. MKV stores the Cues (seek index) near the
+/// end; every time-seek re-reads them. Pinning the tail turns those re-reads
+/// into memory hits instead of network round-trips that also reset the window.
+pub(crate) const PIN_TAIL: u64 = 16 * 1_048_576; // 16 MiB
 
 // ── FetchPlan ────────────────────────────────────────────────────────
 
@@ -48,6 +57,95 @@ pub(crate) enum FetchStrategy {
 impl FetchStrategy {
     pub(crate) fn is_stream(self) -> bool {
         matches!(self, Self::StartStream | Self::ContinueStream)
+    }
+}
+
+// ── PinnedRegion ──────────────────────────────────────────────────────
+
+/// A small byte run kept for the whole file-handle lifetime, never evicted by
+/// the streaming buffer. Holds a contiguous span `[start, start + data.len())`
+/// capped at `cap` bytes. Used to pin a media file's parse index (header at the
+/// front, MKV Cues at the tail) so seeks re-read it from memory instead of the
+/// network. Data is absorbed forward-contiguously; a non-contiguous fetch
+/// re-anchors the region (the previous run is dropped).
+#[derive(Default)]
+struct PinnedRegion {
+    start: u64,
+    data: BytesMut,
+    cap: usize,
+}
+
+impl PinnedRegion {
+    fn new(cap: usize) -> Self {
+        Self {
+            start: 0,
+            data: BytesMut::new(),
+            cap,
+        }
+    }
+
+    fn end(&self) -> u64 {
+        self.start + self.data.len() as u64
+    }
+
+    /// True if absorbing a fetch covering `[offset, offset + len)` would add
+    /// bytes we don't already hold. Lets the caller skip the slice/copy when
+    /// the region is already full or fully covers the range.
+    fn wants(&self, offset: u64, len: u64) -> bool {
+        if self.cap == 0 || len == 0 {
+            return false;
+        }
+        if self.data.is_empty() {
+            return true;
+        }
+        if self.data.len() >= self.cap {
+            return false;
+        }
+        // New bytes past the current end, or a re-anchoring run (gap / backward).
+        offset + len > self.end() || offset < self.start
+    }
+
+    /// Absorb `bytes` known to start at file offset `offset`. Extends the run
+    /// forward when contiguous, ignores already-held bytes, re-anchors on a gap.
+    fn absorb(&mut self, offset: u64, bytes: &[u8]) {
+        if bytes.is_empty() || self.cap == 0 {
+            return;
+        }
+        if self.data.is_empty() {
+            self.start = offset;
+            self.data.extend_from_slice(bytes);
+        } else {
+            let cur_end = self.end();
+            if offset == cur_end {
+                self.data.extend_from_slice(bytes);
+            } else if offset >= self.start && offset < cur_end {
+                // Overlap: append only the part beyond what we already hold.
+                let already = (cur_end - offset) as usize;
+                if already < bytes.len() {
+                    self.data.extend_from_slice(&bytes[already..]);
+                }
+            } else {
+                // Gap (forward jump or backward): re-anchor on the new run.
+                self.start = offset;
+                self.data.clear();
+                self.data.extend_from_slice(bytes);
+            }
+        }
+        if self.data.len() > self.cap {
+            self.data.truncate(self.cap);
+        }
+    }
+
+    /// Serve `[offset, offset + size)` if it starts inside the region. Clamped
+    /// to what's held (a partial hit is completed by the caller's fetch loop).
+    fn serve(&self, offset: u64, size: u32) -> Option<Bytes> {
+        if self.data.is_empty() || offset < self.start || offset >= self.end() {
+            return None;
+        }
+        let local = (offset - self.start) as usize;
+        let avail = self.data.len() - local;
+        let to_read = (size as usize).min(avail);
+        Some(Bytes::copy_from_slice(&self.data[local..local + to_read]))
     }
 }
 
@@ -82,6 +180,10 @@ pub(crate) struct PrefetchState {
     pub(crate) stream: Option<Box<dyn DownloadStreamOps>>,
     /// When true, drain consumed bytes after serving (no re-read from buffer).
     forward_only: bool,
+    // Pinned parse-index regions (disabled in forward-only mode). Survive the
+    // whole handle lifetime so a media seek re-reads header + Cues from memory.
+    pin_head: PinnedRegion,
+    pin_tail: PinnedRegion,
 }
 
 impl PrefetchState {
@@ -98,6 +200,51 @@ impl PrefetchState {
             window_size: INITIAL_WINDOW,
             stream: None,
             forward_only,
+            pin_head: PinnedRegion::new(PIN_HEAD as usize),
+            pin_tail: PinnedRegion::new(PIN_TAIL as usize),
+        }
+    }
+
+    /// Serve a read from a pinned index region (head or tail). Returns a partial
+    /// slice on a boundary hit, which the caller's fetch loop completes.
+    pub(crate) fn try_serve_pinned(&self, offset: u64, size: u32) -> Option<Bytes> {
+        if self.forward_only {
+            return None;
+        }
+        self.pin_head
+            .serve(offset, size)
+            .or_else(|| self.pin_tail.serve(offset, size))
+    }
+
+    /// Capture freshly fetched bytes that fall in the head or tail index window.
+    /// Called from `store_fetched`, so only network data (never buffer re-reads)
+    /// is pinned. Reads from the chunk buffer are zero-copy when single-chunk.
+    fn absorb_pins(&mut self, offset: u64, chunks: &VecDeque<Bytes>, total: usize) {
+        if self.forward_only || total == 0 {
+            return;
+        }
+        let end = offset + total as u64;
+
+        // Head window: [0, PIN_HEAD).
+        if offset < PIN_HEAD {
+            let hi = end.min(PIN_HEAD);
+            let count = (hi - offset) as usize;
+            if count > 0 && self.pin_head.wants(offset, count as u64) {
+                let bytes = read_chunk_range(chunks, 0, 0, count);
+                self.pin_head.absorb(offset, &bytes);
+            }
+        }
+
+        // Tail window: [file_size - PIN_TAIL, file_size).
+        let tail_lo = self.file_size.saturating_sub(PIN_TAIL);
+        if self.file_size > 0 && end > tail_lo {
+            let lo = offset.max(tail_lo);
+            let count = (end - lo) as usize;
+            if count > 0 && self.pin_tail.wants(lo, count as u64) {
+                let skip = (lo - offset) as usize;
+                let bytes = read_chunk_range(chunks, 0, skip, count);
+                self.pin_tail.absorb(lo, &bytes);
+            }
         }
     }
 
@@ -175,6 +322,7 @@ impl PrefetchState {
 
     /// Store freshly downloaded chunks in the forward buffer.
     pub(crate) fn store_fetched(&mut self, offset: u64, chunks: VecDeque<Bytes>, total: usize) {
+        self.absorb_pins(offset, &chunks, total);
         self.chunks = chunks;
         self.chunks_len = total;
         self.chunks_front_offset = 0;
@@ -657,5 +805,71 @@ mod tests {
         let mut ps = PrefetchState::new("hash".into(), 100, false);
         let plan = ps.prepare_fetch(90, 20);
         assert_eq!(plan.fetch_size, 10);
+    }
+
+    // ── Pinned index regions ────────────────────────────────────────
+
+    fn vd(chunk: &[u8]) -> VecDeque<Bytes> {
+        VecDeque::from(vec![Bytes::copy_from_slice(chunk)])
+    }
+
+    #[test]
+    fn pinned_region_absorb_and_serve() {
+        let mut r = PinnedRegion::new(8);
+        r.absorb(100, &[1, 2, 3]);
+        // Contiguous extension.
+        r.absorb(103, &[4, 5]);
+        let got = r.serve(101, 3).unwrap();
+        assert_eq!(&got[..], &[2, 3, 4]);
+        // Out of range → None.
+        assert!(r.serve(99, 1).is_none());
+        assert!(r.serve(105, 1).is_none());
+    }
+
+    #[test]
+    fn pinned_region_caps_and_overlap() {
+        let mut r = PinnedRegion::new(4);
+        r.absorb(0, &[1, 2, 3]);
+        // Overlapping re-fetch: only the new tail byte is appended, then capped.
+        r.absorb(2, &[3, 4, 5, 6]);
+        assert_eq!(r.data.len(), 4); // capped
+        assert_eq!(&r.serve(0, 4).unwrap()[..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pinned_region_reanchors_on_gap() {
+        let mut r = PinnedRegion::new(16);
+        r.absorb(0, &[1, 2, 3]);
+        r.absorb(1000, &[9, 9]); // far gap → re-anchor
+        assert!(r.serve(0, 1).is_none());
+        assert_eq!(&r.serve(1000, 2).unwrap()[..], &[9, 9]);
+    }
+
+    #[test]
+    fn pins_survive_seek_head_and_tail() {
+        // 100 MiB file: head window [0,16MiB), tail window [84MiB,100MiB).
+        let file_size = 100 * 1_048_576;
+        let mut ps = PrefetchState::new("hash".into(), file_size, false);
+
+        // Read the header (offset 0) and the Cues (near EOF): both get pinned.
+        ps.store_fetched(0, vd(&[0xAA; 4096]), 4096);
+        ps.store_fetched(file_size - 4096, vd(&[0xBB; 4096]), 4096);
+
+        // Simulate a seek that repositions the forward buffer to mid-file,
+        // evicting everything — the pins must still answer index re-reads.
+        ps.store_fetched(50 * 1_048_576, vd(&[0xCC; 4096]), 4096);
+
+        assert_eq!(&ps.try_serve_pinned(0, 16).unwrap()[..], &[0xAA; 16]);
+        let tail = ps.try_serve_pinned(file_size - 16, 16).unwrap();
+        assert_eq!(&tail[..], &[0xBB; 16]);
+        // Mid-file (the seek target) is not an index region → not pinned.
+        assert!(ps.try_serve_pinned(50 * 1_048_576, 16).is_none());
+    }
+
+    #[test]
+    fn pins_disabled_in_forward_only() {
+        let mut ps = PrefetchState::new("hash".into(), 100 * 1_048_576, true);
+        ps.store_fetched(0, vd(&[0xAA; 4096]), 4096);
+        assert!(ps.try_serve_pinned(0, 16).is_none());
     }
 }

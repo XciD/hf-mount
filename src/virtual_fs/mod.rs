@@ -2838,9 +2838,23 @@ impl VirtualFs {
                 let mut cursor = offset;
 
                 // Fast path: forward buffer has enough data (common case, zero-copy).
+                // Checked first so steady-state sequential playback keeps draining
+                // the stream smoothly and the pinned regions never disturb it.
                 if let Some(data) = prefetch_state.try_serve_forward(offset, size) {
                     if data.len() == to_read {
                         debug!("prefetch hit (forward): offset={}, len={}", offset, data.len());
+                        let eof = offset + data.len() as u64 >= file_size;
+                        return Ok((data, eof));
+                    }
+                    cursor += data.len() as u64;
+                    response.extend_from_slice(&data);
+                } else if let Some(data) = prefetch_state.try_serve_pinned(offset, size) {
+                    // Pinned index regions (head + tail): a media seek re-reads the
+                    // parse index (MKV header + Cues). Served from memory so it never
+                    // reaches prepare_fetch — no window reset / stream cancel, which is
+                    // what made scattered index re-reads stall the seek.
+                    if data.len() == to_read {
+                        debug!("prefetch hit (pinned): offset={}, len={}", offset, data.len());
                         let eof = offset + data.len() as u64 >= file_size;
                         return Ok((data, eof));
                     }
