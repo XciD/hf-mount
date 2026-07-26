@@ -158,6 +158,15 @@ pub struct MountOptions {
     #[arg(long, default_value_t = false)]
     pub direct_io: bool,
 
+    /// Daemon-wide cap (bytes) on RAM pinned for media parse indexes (head +
+    /// tail of open files, kept hot so player seeks skip the network). Pins
+    /// are per-handle (up to 32 MiB each): without a cap, a library scan
+    /// probing hundreds of files balloons the daemon by gigabytes. When the
+    /// budget is full, new pins are skipped until handles close. 0 disables
+    /// pinning entirely.
+    #[arg(long, default_value_t = 512 * 1024 * 1024)]
+    pub pinned_cache_max_bytes: usize,
+
     /// Kernel metadata cache TTL in milliseconds. Controls how long file
     /// attributes are trusted before re-checking via HEAD. Lower values
     /// give fresher metadata but increase latency on directory traversals
@@ -542,7 +551,7 @@ pub fn build_with_runtime(
         "Config: advanced_writes={} sparse_writes={} overlay={} remote_read_only={} direct_io={} poll_interval={}s \
          poll_listing_concurrency={} metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_staging_size={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms uid={} gid={} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms read_fetch_timeout={}ms pinned_cache_max={} uid={} gid={} filter_os_files={}",
         advanced_writes,
         sparse_writes,
         options.overlay,
@@ -560,6 +569,7 @@ pub fn build_with_runtime(
         options.flush_debounce_ms,
         options.flush_max_batch_window_ms,
         options.read_fetch_timeout_ms,
+        options.pinned_cache_max_bytes,
         uid,
         gid,
         !options.no_filter_os_files,
@@ -599,6 +609,7 @@ pub fn build_with_runtime(
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
             flush_shutdown_timeout: std::time::Duration::from_millis(options.flush_shutdown_timeout_ms),
             read_fetch_timeout: std::time::Duration::from_millis(options.read_fetch_timeout_ms),
+            pinned_cache_max_bytes: options.pinned_cache_max_bytes,
             // NFS clients use inode numbers as stable file IDs; evicting an
             // inode the client still holds would surface as NFS3ERR_STALE on
             // its next RPC. The eviction safety hooks (forget / inval_entry)

@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use tracing::debug;
@@ -29,6 +31,61 @@ pub(crate) const PIN_HEAD: u64 = 16 * 1_048_576; // 16 MiB
 /// end; every time-seek re-reads them. Pinning the tail turns those re-reads
 /// into memory hits instead of network round-trips that also reset the window.
 pub(crate) const PIN_TAIL: u64 = 16 * 1_048_576; // 16 MiB
+
+// ── PinBudget ─────────────────────────────────────────────────────────
+
+/// Daemon-wide byte budget shared by every handle's pinned index regions.
+///
+/// Pins are per-handle (up to `PIN_HEAD + PIN_TAIL` = 32 MiB each) and live for
+/// the handle's lifetime. Without a global cap, a library scan that probes
+/// hundreds of media files concurrently pins gigabytes: on a 13 GB host, two
+/// daemons under a Radarr+Jellyfin scan reached 9 GB RSS and starved the page
+/// cache (2026-07-26 incident). The budget bounds the total: when exhausted,
+/// new absorbs are skipped (deny-when-full) rather than evicting other
+/// handles' pins — scanner handles are short-lived and release their share on
+/// close, so the budget self-heals without cross-handle locking on the read
+/// path.
+pub(crate) struct PinBudget {
+    used: AtomicUsize,
+    cap: usize,
+}
+
+impl PinBudget {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// Reserve `delta` bytes. False when it would exceed the cap (caller skips
+    /// the absorb; nothing is reserved).
+    fn try_grow(&self, delta: usize) -> bool {
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = match current.checked_add(delta) {
+                Some(next) if next <= self.cap => next,
+                _ => return false,
+            };
+            match self
+                .used
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release(&self, delta: usize) {
+        self.used.fetch_sub(delta, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn used_bytes(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
 
 // ── FetchPlan ────────────────────────────────────────────────────────
 
@@ -107,9 +164,34 @@ impl PinnedRegion {
 
     /// Absorb `bytes` known to start at file offset `offset`. Extends the run
     /// forward when contiguous, ignores already-held bytes, re-anchors on a gap.
-    fn absorb(&mut self, offset: u64, bytes: &[u8]) {
+    /// Growth is charged to the daemon-wide `budget`; when it can't be reserved
+    /// the absorb is skipped whole (existing pinned data stays valid).
+    fn absorb(&mut self, offset: u64, bytes: &[u8], budget: &PinBudget) {
         if bytes.is_empty() || self.cap == 0 {
             return;
+        }
+        // Final length this absorb produces, mirroring the branches below.
+        let planned = if self.data.is_empty() {
+            bytes.len().min(self.cap)
+        } else {
+            let cur_end = self.end();
+            if offset == cur_end {
+                (self.data.len() + bytes.len()).min(self.cap)
+            } else if offset >= self.start && offset < cur_end {
+                let already = (cur_end - offset) as usize;
+                (self.data.len() + bytes.len().saturating_sub(already)).min(self.cap)
+            } else {
+                bytes.len().min(self.cap)
+            }
+        };
+        let old_len = self.data.len();
+        if planned > old_len {
+            if !budget.try_grow(planned - old_len) {
+                debug!("pin budget exhausted, skipping absorb of {} bytes", planned - old_len);
+                return;
+            }
+        } else if planned < old_len {
+            budget.release(old_len - planned);
         }
         if self.data.is_empty() {
             self.start = offset;
@@ -134,6 +216,7 @@ impl PinnedRegion {
         if self.data.len() > self.cap {
             self.data.truncate(self.cap);
         }
+        debug_assert_eq!(self.data.len(), planned, "absorb accounting drifted from mutation");
     }
 
     /// Serve `[offset, offset + size)` if it starts inside the region. Clamped
@@ -184,10 +267,19 @@ pub(crate) struct PrefetchState {
     // whole handle lifetime so a media seek re-reads header + Cues from memory.
     pin_head: PinnedRegion,
     pin_tail: PinnedRegion,
+    /// Lazy arming: pins only absorb after this handle has demonstrated seek
+    /// behaviour (first RangeDownload). A library scanner reads the header in
+    /// one sequential pass and closes — it never arms, so scans don't pin
+    /// megabytes per probed file. A player's first seek arms the handle; the
+    /// index regions are then captured from the fetches that seek triggers
+    /// (one-time network re-read), and every later seek hits memory.
+    pins_armed: bool,
+    /// Daemon-wide budget the pins draw from (see [`PinBudget`]).
+    pin_budget: Arc<PinBudget>,
 }
 
 impl PrefetchState {
-    pub(crate) fn new(xet_hash: String, file_size: u64, forward_only: bool) -> Self {
+    pub(crate) fn new(xet_hash: String, file_size: u64, forward_only: bool, pin_budget: Arc<PinBudget>) -> Self {
         Self {
             xet_hash,
             file_size,
@@ -202,6 +294,8 @@ impl PrefetchState {
             forward_only,
             pin_head: PinnedRegion::new(PIN_HEAD as usize),
             pin_tail: PinnedRegion::new(PIN_TAIL as usize),
+            pins_armed: false,
+            pin_budget,
         }
     }
 
@@ -220,7 +314,7 @@ impl PrefetchState {
     /// Called from `store_fetched`, so only network data (never buffer re-reads)
     /// is pinned. Reads from the chunk buffer are zero-copy when single-chunk.
     fn absorb_pins(&mut self, offset: u64, chunks: &VecDeque<Bytes>, total: usize) {
-        if self.forward_only || total == 0 {
+        if self.forward_only || !self.pins_armed || total == 0 {
             return;
         }
         let end = offset + total as u64;
@@ -231,7 +325,7 @@ impl PrefetchState {
             let count = (hi - offset) as usize;
             if count > 0 && self.pin_head.wants(offset, count as u64) {
                 let bytes = read_chunk_range(chunks, 0, 0, count);
-                self.pin_head.absorb(offset, &bytes);
+                self.pin_head.absorb(offset, &bytes, &self.pin_budget);
             }
         }
 
@@ -243,7 +337,7 @@ impl PrefetchState {
             if count > 0 && self.pin_tail.wants(lo, count as u64) {
                 let skip = (lo - offset) as usize;
                 let bytes = read_chunk_range(chunks, 0, skip, count);
-                self.pin_tail.absorb(lo, &bytes);
+                self.pin_tail.absorb(lo, &bytes, &self.pin_budget);
             }
         }
     }
@@ -277,6 +371,9 @@ impl PrefetchState {
             // which are heavily random — avoids wasting ~8MB of prefetch on every seek.
             self.window_size = INITIAL_WINDOW;
             debug!("prefetch window reset to {}", self.window_size);
+            // First demonstrated seek: from now on, fetches touching the index
+            // windows are pinned (see `pins_armed`).
+            self.pins_armed = true;
             false
         };
 
@@ -429,6 +526,15 @@ impl PrefetchState {
     }
 }
 
+impl Drop for PrefetchState {
+    /// Handle closed: return the pinned bytes to the daemon-wide budget so
+    /// other handles (e.g. an active playback) can pin again.
+    fn drop(&mut self) {
+        self.pin_budget.release(self.pin_head.data.len());
+        self.pin_budget.release(self.pin_tail.data.len());
+    }
+}
+
 /// Read `count` bytes starting at logical offset `skip` from the chunk buffer.
 /// Returns zero-copy `Bytes::slice()` when the read fits in a single chunk.
 fn read_chunk_range(chunks: &VecDeque<Bytes>, front_offset: usize, skip: usize, count: usize) -> Bytes {
@@ -467,9 +573,15 @@ fn read_chunk_range(chunks: &VecDeque<Bytes>, front_offset: usize, skip: usize, 
 mod tests {
     use super::*;
 
+    /// Helper: a budget no test can exhaust (pin behaviour under budget
+    /// pressure is covered by the dedicated budget tests).
+    fn unlimited() -> Arc<PinBudget> {
+        Arc::new(PinBudget::new(usize::MAX))
+    }
+
     /// Helper: create a PrefetchState pre-loaded with chunks at a given offset.
     fn ps_with_chunks(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, unlimited());
         ps.buf_start = buf_start;
         for chunk in chunks {
             let b = Bytes::copy_from_slice(chunk);
@@ -530,7 +642,7 @@ mod tests {
     #[test]
     fn seek_window_basic() {
         // Backward seek window serves previously consumed bytes.
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, unlimited());
         ps.seek_data.extend(&[10, 20, 30, 40, 50]);
         ps.seek_start = 100;
         let result = ps.try_serve_seek(102, 2).unwrap();
@@ -539,7 +651,7 @@ mod tests {
 
     #[test]
     fn seek_window_out_of_range() {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, unlimited());
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 100;
         assert!(ps.try_serve_seek(99, 1).is_none());
@@ -599,7 +711,7 @@ mod tests {
 
     #[test]
     fn empty_buffer() {
-        let mut ps = PrefetchState::new("hash".into(), 100, false);
+        let mut ps = PrefetchState::new("hash".into(), 100, false, unlimited());
         assert!(ps.try_serve_forward(0, 10).is_none());
     }
 
@@ -616,7 +728,7 @@ mod tests {
     #[test]
     fn seek_zero_size() {
         // A zero-size seek read at a valid offset should return Some(empty).
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, unlimited());
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 0;
         let result = ps.try_serve_seek(0, 0).unwrap();
@@ -677,7 +789,7 @@ mod tests {
     // ── Forward-only mode tests ─────────────────────────────────────
 
     fn ps_forward_only(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, true);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, true, unlimited());
         ps.buf_start = buf_start;
         for chunk in chunks {
             let b = Bytes::copy_from_slice(chunk);
@@ -737,7 +849,7 @@ mod tests {
 
     #[test]
     fn prepare_fetch_window_doubles_to_max() {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, unlimited());
         ps.buf_start = 0;
         ps.chunks.push_back(Bytes::from(vec![0u8; 1]));
         ps.chunks_len = 1;
@@ -802,7 +914,7 @@ mod tests {
 
     #[test]
     fn prepare_fetch_clamps_to_file_size() {
-        let mut ps = PrefetchState::new("hash".into(), 100, false);
+        let mut ps = PrefetchState::new("hash".into(), 100, false, unlimited());
         let plan = ps.prepare_fetch(90, 20);
         assert_eq!(plan.fetch_size, 10);
     }
@@ -815,10 +927,11 @@ mod tests {
 
     #[test]
     fn pinned_region_absorb_and_serve() {
+        let b = PinBudget::new(usize::MAX);
         let mut r = PinnedRegion::new(8);
-        r.absorb(100, &[1, 2, 3]);
+        r.absorb(100, &[1, 2, 3], &b);
         // Contiguous extension.
-        r.absorb(103, &[4, 5]);
+        r.absorb(103, &[4, 5], &b);
         let got = r.serve(101, 3).unwrap();
         assert_eq!(&got[..], &[2, 3, 4]);
         // Out of range → None.
@@ -828,28 +941,35 @@ mod tests {
 
     #[test]
     fn pinned_region_caps_and_overlap() {
+        let b = PinBudget::new(usize::MAX);
         let mut r = PinnedRegion::new(4);
-        r.absorb(0, &[1, 2, 3]);
+        r.absorb(0, &[1, 2, 3], &b);
         // Overlapping re-fetch: only the new tail byte is appended, then capped.
-        r.absorb(2, &[3, 4, 5, 6]);
+        r.absorb(2, &[3, 4, 5, 6], &b);
         assert_eq!(r.data.len(), 4); // capped
         assert_eq!(&r.serve(0, 4).unwrap()[..], &[1, 2, 3, 4]);
+        // Budget accounting followed the mutation exactly.
+        assert_eq!(b.used_bytes(), 4);
     }
 
     #[test]
     fn pinned_region_reanchors_on_gap() {
+        let b = PinBudget::new(usize::MAX);
         let mut r = PinnedRegion::new(16);
-        r.absorb(0, &[1, 2, 3]);
-        r.absorb(1000, &[9, 9]); // far gap → re-anchor
+        r.absorb(0, &[1, 2, 3], &b);
+        r.absorb(1000, &[9, 9], &b); // far gap → re-anchor
         assert!(r.serve(0, 1).is_none());
         assert_eq!(&r.serve(1000, 2).unwrap()[..], &[9, 9]);
+        // Re-anchor shrank 3 → 2: the freed byte went back to the budget.
+        assert_eq!(b.used_bytes(), 2);
     }
 
     #[test]
     fn pins_survive_seek_head_and_tail() {
         // 100 MiB file: head window [0,16MiB), tail window [84MiB,100MiB).
         let file_size = 100 * 1_048_576;
-        let mut ps = PrefetchState::new("hash".into(), file_size, false);
+        let mut ps = PrefetchState::new("hash".into(), file_size, false, unlimited());
+        ps.pins_armed = true; // handle has already demonstrated seek behaviour
 
         // Read the header (offset 0) and the Cues (near EOF): both get pinned.
         ps.store_fetched(0, vd(&[0xAA; 4096]), 4096);
@@ -868,7 +988,75 @@ mod tests {
 
     #[test]
     fn pins_disabled_in_forward_only() {
-        let mut ps = PrefetchState::new("hash".into(), 100 * 1_048_576, true);
+        let mut ps = PrefetchState::new("hash".into(), 100 * 1_048_576, true, unlimited());
+        ps.pins_armed = true; // even armed, forward-only must never pin
+        ps.store_fetched(0, vd(&[0xAA; 4096]), 4096);
+        assert!(ps.try_serve_pinned(0, 16).is_none());
+    }
+
+    // ── Lazy arming + global budget ─────────────────────────────────
+
+    #[test]
+    fn scanner_single_pass_pins_nothing() {
+        // A library scanner reads the header sequentially and closes: no far
+        // seek ever happens, so nothing is pinned and no budget is consumed.
+        let budget = Arc::new(PinBudget::new(usize::MAX));
+        let mut ps = PrefetchState::new("hash".into(), 100 * 1_048_576, false, budget.clone());
+        ps.store_fetched(0, vd(&[0xAA; 4096]), 4096);
+        assert!(ps.try_serve_pinned(0, 16).is_none());
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn far_seek_arms_pinning() {
+        let file_size = 100 * 1_048_576;
+        let budget = Arc::new(PinBudget::new(usize::MAX));
+        let mut ps = PrefetchState::new("hash".into(), file_size, false, budget.clone());
+
+        // Header pass before any seek: not pinned.
+        ps.store_fetched(0, vd(&[0xAA; 4096]), 4096);
+        assert!(ps.try_serve_pinned(0, 16).is_none());
+
+        // Far seek to the Cues: RangeDownload arms pinning...
+        let plan = ps.prepare_fetch(file_size - 4096, 4096);
+        assert_eq!(plan.strategy, FetchStrategy::RangeDownload);
+        // ...and the fetch that seek triggers is captured.
+        ps.store_fetched(file_size - 4096, vd(&[0xBB; 4096]), 4096);
+        assert_eq!(&ps.try_serve_pinned(file_size - 16, 16).unwrap()[..], &[0xBB; 16]);
+        assert_eq!(budget.used_bytes(), 4096);
+    }
+
+    #[test]
+    fn budget_shared_denies_then_recovers_on_drop() {
+        // Two handles share a 6 KiB budget; each absorb tries 4 KiB.
+        let file_size = 100 * 1_048_576;
+        let budget = Arc::new(PinBudget::new(6 * 1024));
+
+        let mut a = PrefetchState::new("a".into(), file_size, false, budget.clone());
+        a.pins_armed = true;
+        a.store_fetched(0, vd(&[0xAA; 4096]), 4096);
+        assert_eq!(budget.used_bytes(), 4096);
+
+        // Second handle: 4 KiB more would exceed 6 KiB → denied whole.
+        let mut b = PrefetchState::new("b".into(), file_size, false, budget.clone());
+        b.pins_armed = true;
+        b.store_fetched(0, vd(&[0xBB; 4096]), 4096);
+        assert!(b.try_serve_pinned(0, 16).is_none());
+        assert_eq!(budget.used_bytes(), 4096);
+
+        // First handle closes: its pins return to the budget...
+        drop(a);
+        assert_eq!(budget.used_bytes(), 0);
+        // ...and the second handle can pin again.
+        b.store_fetched(0, vd(&[0xBB; 4096]), 4096);
+        assert_eq!(&b.try_serve_pinned(0, 16).unwrap()[..], &[0xBB; 16]);
+        assert_eq!(budget.used_bytes(), 4096);
+    }
+
+    #[test]
+    fn zero_budget_disables_pinning() {
+        let mut ps = PrefetchState::new("hash".into(), 100 * 1_048_576, false, Arc::new(PinBudget::new(0)));
+        ps.pins_armed = true;
         ps.store_fetched(0, vd(&[0xAA; 4096]), 4096);
         assert!(ps.try_serve_pinned(0, 16).is_none());
     }

@@ -22,7 +22,7 @@ mod prefetch;
 mod staging;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
-use prefetch::{FetchPlan, PrefetchState};
+use prefetch::{FetchPlan, PinBudget, PrefetchState};
 use staging::StagingCoordinator;
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -148,6 +148,9 @@ pub struct VfsConfig {
     /// indefinitely; once all worker threads are parked the mount silently
     /// wedges. `Duration::ZERO` disables the bound (legacy behaviour).
     pub read_fetch_timeout: Duration,
+    /// Daemon-wide cap (bytes) on RAM pinned for media parse indexes across
+    /// all open handles (see `prefetch::PinBudget`). 0 disables pinning.
+    pub pinned_cache_max_bytes: usize,
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
@@ -274,6 +277,8 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    /// Shared byte budget for the pinned index regions of all open handles.
+    pin_budget: Arc<PinBudget>,
     /// Optional whole-file cache. When `Some`, opens hit the local copy if the
     /// xet hash is already populated; misses kick a background populate so the
     /// next open is fast. Mutually exclusive with xet-core's chunk cache.
@@ -384,6 +389,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            pin_budget: Arc::new(PinBudget::new(config.pinned_cache_max_bytes)),
             file_cache,
         });
 
@@ -2314,6 +2320,7 @@ impl VirtualFs {
             xet_hash,
             size,
             self.direct_io,
+            Arc::clone(&self.pin_budget),
         )));
         let file_handle = self.alloc_file_handle();
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);
